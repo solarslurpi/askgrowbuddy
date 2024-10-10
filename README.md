@@ -17,3 +17,11 @@ collection_metadata = {
 }
 
 col = client.get_or_create_collection("test", metadata=collection_metadata)
+
+The challenge: Determine efficient ranking systems.
+
+Bag of Words - How many times does each word in the question appear in each of the documents?  And if the word apprears many times in a short document versus the same amount of times in a long document, the short document has a higher score.  i.e.: The Bag of Words considers how often a word appears in the document and how long the document is. There might be other things, but this is the basic idea I got my heard around.
+
+Llamaindex for retriever
+- QueryFusionRetriever
+- TreeSummarize
