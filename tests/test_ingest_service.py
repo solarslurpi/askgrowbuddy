@@ -1,7 +1,7 @@
 import logging
 import pytest
 
-from langchain.schema import Document
+from llama_index.core import Document as LlamaIndexDocument
 from src.documents import documents
 from src.ingest_service import IngestService
 from src.doc_stats import DocStats
@@ -53,15 +53,11 @@ def collection_metadata(chunk_size, chunk_overlap, chunk_method, embedding_model
     return collection_metadata
 
 def test_loading_list(ingest_service, docs_list):
-    docs = ingest_service.load_docs(docs_list)
+    docs = ingest_service.load_obsidian_notes(docs_list)
     assert len(docs) > 0
-    assert all([isinstance(doc, Document) for doc in docs])
-    stats_dict = DocStats.get_summary_stats(docs)
+    assert all([isinstance(doc, LlamaIndexDocument) for doc in docs])
+    DocStats.print_llama_index_docs_summary_stats(docs)
 
-    # Print out key/value pairs in stats_dict
-    logger.info("\nDocument Statistics:")
-    for key, value in stats_dict.items():
-        logger.info(f"{key}: {value}")
 
 def test_loading_directory(ingest_service, directory):
     docs = ingest_service.load_docs(directory)

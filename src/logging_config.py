@@ -19,6 +19,7 @@ def setup_logging():
     logging.getLogger('query').setLevel(logging.DEBUG)
     logging.getLogger('ingest_input').setLevel(logging.DEBUG)
     logging.getLogger('ingest_service').setLevel(logging.DEBUG)
+    logging.getLogger('soil_test_analyzer').setLevel(logging.DEBUG)
 
     # You can add more specific logger configurations here if needed
     # For example:

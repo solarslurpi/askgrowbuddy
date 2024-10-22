@@ -1,8 +1,9 @@
 import logging
+from typing import Optional
+
+from datetime import date
 
 from pydantic import BaseModel, Field, ConfigDict
-from datetime import date
-from typing import Optional, Dict, Any
 
 from src.logging_config import setup_logging
 
@@ -19,7 +20,7 @@ class BaseSoilReport(BaseModel):
 
 class M3Report(BaseSoilReport):
     ph: float = Field(..., alias="pH of Soil Sample")
-    organic_matter: str = Field(..., alias="Organic Matter, Percent")
+    organic_matter: float = Field(..., alias="Organic Matter, Percent")
     tec: float = Field(..., alias="Total Exchange Capacity (M. E.)")
     calcium_lbs: float = Field(..., alias="Desired Value\nCALCIUM:\nValue Found\nlbs / acre\nDeficit")
     magnesium_lbs: float = Field(..., alias="Desired Value\nMAGNESIUM:\nValue Found\nlbs / acre\nDeficit")
@@ -46,7 +47,6 @@ class M3Report(BaseSoilReport):
     # Allow the field names to be used as keys for the values.
     model_config = ConfigDict(populate_by_name=True)
 
-# Saturated Paste Report Model
 class SPReport(BaseSoilReport):
     ph: float = Field(..., alias="pH")
     soluble_salts_ppm: float = Field(..., alias="Soluble Salts ppm")
@@ -58,6 +58,10 @@ class SPReport(BaseSoilReport):
     magnesium_ppm: float = Field(..., alias="MAGNESIUM")
     potassium_ppm: float = Field(..., alias="POTASSIUM:")
     sodium_ppm: float = Field(..., alias="SODIUM")
+    calcium_meq: float = Field(None, alias="CALCIUM meq/l")
+    magnesium_meq: float = Field(None, alias="MAGNESIUM meq/l")
+    potassium_meq: float = Field(None, alias="POTASSIUM meq/l")
+    sodium_meq: float = Field(None, alias="SODIUM meq/l")
     calcium_pct: float = Field(..., alias="Calcium")
     magnesium_pct: float = Field(..., alias="Magnesium")
     potassium_pct: float = Field(..., alias="Potassium")
@@ -71,34 +75,34 @@ class SPReport(BaseSoilReport):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    @classmethod
-    def convert_float_strs_to_float(cls, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Converts string representations of numbers in the dictionary to floats.
-        Handles special cases like strings starting with '>'.
+class SoilReportSingleton:
+    _instance = None
 
-        Args:
-            data (Dict[str, Any]): The dictionary with string values to convert.
+    def __init__(self):
+        self.m3_report: Optional[M3Report] = None
+        self.sp_report: Optional[SPReport] = None
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance.m3_report = None
+            cls._instance.sp_report = None
+        return cls._instance
 
-        Returns:
-            Dict[str, Any]: The dictionary with converted float values.
-        """
-        converted_data = {}
-        for key, value in data.items():
-            if isinstance(value, str) and key != 'sample_date':
-                try:
-                    # Handle cases like '>20'
-                    if value.startswith(('>', '<')):
-                        converted_value = float(value[1:])
-                    else:
-                        converted_value = float(value.replace(',', ''))
-                    converted_data[key] = converted_value
-                except ValueError:
-                    logging.warning(f"Unable to convert field '{key}' with value '{value}' to float.")
-                    converted_data[key] = value  # Keep original value if conversion fails
-            else:
-                converted_data[key] = value  # Keep original value if not a string
-        return converted_data
+    def set_m3_report(self, report: M3Report):
+        self.m3_report = report
+
+    def set_sp_report(self, report: SPReport):
+        self.sp_report = report
+
+    def get_m3_report(self) -> Optional[M3Report]:
+        return self.m3_report
+
+    def get_sp_report(self) -> Optional[SPReport]:
+        return self.sp_report
+
+    def set_reports(self, m3_report, sp_report):
+        self.m3_report = m3_report
+        self.sp_report = sp_report
 
 
 # Readings to exclude
@@ -109,3 +113,9 @@ readings_to_exclude = set([
     "Sample Depth in inches",
     "Water Used",
 ])
+
+# Create a global instance of the singleton
+soil_report_instance = SoilReportSingleton()
+
+# Add this line at the end of the file
+__all__ = ['soil_report_instance']

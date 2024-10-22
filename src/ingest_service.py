@@ -1,20 +1,23 @@
 import logging
 import os
+import re
 from typing import List
 import dotenv
 import chromadb
 import ollama
 
 from langchain_community.document_loaders import ObsidianLoader
+from langchain.text_splitter import MarkdownHeaderTextSplitter
 from llama_index.core import Document as LlamaIndexDocument
-from llama_index.core.node_parser import MarkdownNodeParser
 from llama_index.core import VectorStoreIndex
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 from llama_index.core import PropertyGraphIndex
 from llama_index.llms.ollama import Ollama
-from llama_index.embeddings.ollama import OllamaEmbedding
+from src.ollama_embedding import OllamaEmbedding
 from llama_index.core import Settings
+from llama_index.core.schema import TextNode
+
 
 from src.logging_config import setup_logging
 from src.bm25_retriever_code import BM25Retriever
@@ -63,27 +66,53 @@ class IngestService:
         if not dir_or_list:
             raise ValueError("A directory with text files or a list of strings must be passed in.")
         if isinstance(dir_or_list, list):
-            docs = [LlamaIndexDocument(text=doc, metadata={}) for doc in dir_or_list]
+            docs = [
+            LlamaIndexDocument(text=text, metadata={"source": f"string_{i}"})
+            for i, text in enumerate(dir_or_list)
+            ]
         else:
             if not os.path.exists(dir_or_list):
                 raise ValueError(f"Directory does not exist: {dir_or_list}")
             loader = ObsidianLoader(path=dir_or_list, collect_metadata=True)
             langchain_docs = loader.load()
             docs = [
-                LlamaIndexDocument(text=doc.page_content, metadata=doc.metadata)
+                LlamaIndexDocument(
+                    text=self._remove_timestamp_blocks(doc.page_content),
+                    metadata=doc.metadata
+                )
+                # LlamaIndexDocument.from_langchain_format(doc)
                 for doc in langchain_docs
             ]
 
         return docs
+    def _remove_timestamp_blocks(self, text: str) -> str:
+        '''Many notes have a timestamp codeblock interspersed in the text to support YouTube playback. This function removes them.'''
 
-    def chunk_text(self, docs: list[LlamaIndexDocument]) -> list[LlamaIndexDocument]:
 
-        # The Text is split into chunks. Differnt techniques can be used. We start are exploration using Markdown chunking.  I decided to explore using Llamaindex.
-        # logger.debug(f"Chunking text with chunk size: {chunk_size} and overlap: {chunk_overlap}")
-        parser = MarkdownNodeParser(include_metadata=True)
+        pattern = r'```timestamp(?:-url)?\n.*?\n```'
+        return re.sub(pattern, '', text)
 
-        nodes: list[LlamaIndexDocument] = parser.get_nodes_from_documents(docs)
+    def chunk_text(self, docs: list[LlamaIndexDocument]) -> list[TextNode]:
+        headers_to_split_on = [
+            ("#", "Header 1"),
+            # ("##", "Header 2"),
+            # ("###", "Header 3"),
+        ]
+        splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on,strip_headers=False)
+        nodes = []
+        for doc in docs:
+            note_text = doc.text
+            note_metadata = doc.metadata
+            langchain_nodes = splitter.split_text(note_text)
 
+            # Convert Langchain nodes to LlamaIndex TextNodes
+            nodes.extend([
+                TextNode(
+                    text=node.page_content,
+                    metadata={**node.metadata, **note_metadata}
+                )
+                for node in langchain_nodes
+            ])
         if not nodes:
             raise ValueError("No text chunks generated.")
         return nodes
@@ -140,7 +169,7 @@ class IngestService:
             logger.error(f"Unexpected error in get_vector_index: {str(e)}", exc_info=True)
             raise
 
-    def build_knowledge_graph(self, documents: List[LlamaIndexDocument], user="neo4j", password=None, embed_model_name='nomic-embed-text', model_name: str = 'mistral'):
+    def build_knowledge_graph(self, documents: List[LlamaIndexDocument], user="neo4j", password=None, embed_model_name='nomic-embed-text', model_name: str = 'mistral') -> PropertyGraphIndex:
         try:
             logger.info(f"Starting to build knowledge graph with {len(documents)} documents")
 
@@ -208,14 +237,15 @@ class IngestService:
             logger.error(f"Unexpected error in get_knowledge_graph: {str(e)}", exc_info=True)
             raise
 
-    def build_bm25_retriever(self, nodes: List[LlamaIndexDocument], persist_dir: str = "bm25_index", similarity_top_k: int = 5):
+    def build_bm25_retriever(self, nodes: List, persist_dir: str = "bm25_index", similarity_top_k: int = 5) -> BM25Retriever:
         try:
             if not nodes:
                 logger.error("The 'nodes' list is empty. Cannot build BM25 retriever without documents.", exc_info=True)
                 raise ValueError("The 'nodes' list is empty. Please provide documents to build the retriever.")
 
             # Build the BM25 retriever from documents
-            retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=similarity_top_k)
+            bm25_retriever = BM25Retriever(nodes=nodes, similarity_top_k=similarity_top_k)
+            retriever = bm25_retriever.from_defaults(nodes=nodes, similarity_top_k=similarity_top_k)
             logger.debug("BM25 retriever successfully created from documents.")
 
             # Ensure the persistence directory exists
@@ -228,18 +258,19 @@ class IngestService:
 
             return retriever
 
-        except Exception as e:
+        except Exception:
             logger.error("An error occurred while building the BM25 retriever.", exc_info=True)
             raise
 
-    def get_bm25_retriever(self, persist_dir: str = "bm25_index", similarity_top_k: int = 5):
+    def get_bm25_retriever(self, persist_dir: str = "bm25_index"):
         try:
             if not os.path.exists(persist_dir):
                 logger.error(f"Persistence directory '{persist_dir}' does not exist.", exc_info=True)
                 raise FileNotFoundError(f"BM25 retriever persistence directory '{persist_dir}' not found.")
 
             # Load the retriever from the persisted directory
-            retriever = BM25Retriever.from_persist_dir(persist_dir, similarity_top_k=similarity_top_k)
+
+            retriever = BM25Retriever.from_persist_dir(persist_dir)
             logger.info(f"BM25 retriever successfully loaded from '{persist_dir}'.")
 
             return retriever
@@ -251,13 +282,14 @@ class IngestService:
             logger.error("An error occurred while loading the BM25 retriever.", exc_info=True)
             raise e
 
+
     def _get_graph_store(self, user="neo4j", password=None, database:str='rag_database'):
         neo4j_uri = "bolt://localhost:7687"  # Update with your Neo4j instance details
         neo4j_user = user
-        neo4j_password = password if password else os.getenv("NEO4J_PASSWORD")
+        neo4j_password = password if password else os.getenv("NEO4J_PASSWORD") # type: ignore
         graph_store = Neo4jPropertyGraphStore(
             username=neo4j_user,
-            password=neo4j_password,
+            password=neo4j_password, # type: ignore
             url=neo4j_uri,
             database=database,  # Use appropriate database name
         )
@@ -279,9 +311,9 @@ class IngestService:
             raise e
 
     def create_collection(self,
-                          docs:list[LlamaIndexDocument]=None,
-                          collection: str = None,
-                          collection_metadata:dict=None,
+                          docs:list[LlamaIndexDocument]=None, # type: ignore
+                          collection: str=None,  # type: ignore
+                          collection_metadata:dict=None, # type: ignore
                           embedding_model_name:str='all-minilm') -> chromadb.Collection:
         """
         Create a ChromaDB collection with document content and embeddings.

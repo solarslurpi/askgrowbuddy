@@ -1,19 +1,14 @@
 import json
 import logging
 import os
-
-from typing import Any, Callable, Dict, List, Optional, cast
-
+from typing import Any, Callable, Dict, List, Optional, cast, Union
+from llama_index.core import Document
 from llama_index.core.base.base_retriever import BaseRetriever
 from llama_index.core.callbacks.base import CallbackManager
 from llama_index.core.constants import DEFAULT_SIMILARITY_TOP_K
 from llama_index.core.indices.vector_store.base import VectorStoreIndex
-from llama_index.core.schema import BaseNode, IndexNode, NodeWithScore, QueryBundle
+from llama_index.core.schema import BaseNode, IndexNode, NodeWithScore, QueryBundle, TextNode
 from llama_index.core.storage.docstore.types import BaseDocumentStore
-from llama_index.core.vector_stores.utils import (
-    node_to_metadata_dict,
-    metadata_dict_to_node,
-)
 
 import bm25s
 import Stemmer
@@ -64,6 +59,7 @@ class BM25Retriever(BaseRetriever):
     ) -> None:
         self.stemmer = stemmer or Stemmer.Stemmer("english")
         self.similarity_top_k = similarity_top_k
+        self._verbose = verbose
 
         if existing_bm25 is not None:
             self.bm25 = existing_bm25
@@ -72,7 +68,13 @@ class BM25Retriever(BaseRetriever):
             if nodes is None:
                 raise ValueError("Please pass nodes or an existing BM25 object.")
 
-            self.corpus = [node_to_metadata_dict(node) for node in nodes]
+            def custom_node_to_metadata_dict(node: BaseNode) -> Dict[str, Any]:
+                metadata = node.metadata.copy() if node.metadata else {}
+                metadata["text"] = node.get_content()
+                metadata["id"] = node.node_id
+                return metadata
+
+            self.corpus = [custom_node_to_metadata_dict(node) for node in nodes]
 
             corpus_tokens = bm25s.tokenize(
                 [node.get_content() for node in nodes],
@@ -82,11 +84,11 @@ class BM25Retriever(BaseRetriever):
             )
             self.bm25 = bm25s.BM25()
             self.bm25.index(corpus_tokens, show_progress=verbose)
+
         super().__init__(
             callback_manager=callback_manager,
             object_map=object_map,
             objects=objects,
-            verbose=verbose,
         )
 
     @classmethod
@@ -141,18 +143,20 @@ class BM25Retriever(BaseRetriever):
     def persist(self, path: str, **kwargs: Any) -> None:
         """Persist the retriever to a directory."""
         self.bm25.save(path, corpus=self.corpus, **kwargs)
-        with open(os.path.join(path, DEFAULT_PERSIST_FILENAME), "w") as f:
+        with open(os.path.join(path, DEFAULT_PERSIST_FILENAME), "w", encoding="utf-8") as f:
             json.dump(self.get_persist_args(), f, indent=2)
 
     @classmethod
     def from_persist_dir(cls, path: str, **kwargs: Any) -> "BM25Retriever":
         """Load the retriever from a directory."""
-        bm25 = bm25s.BM25.load(path, load_corpus=True, **kwargs)
-        with open(os.path.join(path, DEFAULT_PERSIST_FILENAME)) as f:
+        bm25 = bm25s.BM25.load(path, load_corpus=True)
+        with open(os.path.join(path, DEFAULT_PERSIST_FILENAME), encoding='utf-8') as f:
             retriever_data = json.load(f)
+        # Update retriever data with any provided kwargs - like similarity_top_k
+        retriever_data.update(kwargs)
         return cls(existing_bm25=bm25, **retriever_data)
 
-    def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
+    def _retrieve(self, query_bundle: QueryBundle) -> List[Document]:
         query = query_bundle.query_str
         tokenized_query = bm25s.tokenize(
             query, stemmer=self.stemmer, show_progress=self._verbose
@@ -161,30 +165,22 @@ class BM25Retriever(BaseRetriever):
             tokenized_query, k=self.similarity_top_k, show_progress=self._verbose
         )
 
-        # batched, but only one query
-        indexes = indexes[0]
-        scores = scores[0]
+        nodes_with_scores: List[NodeWithScore] = []
+        for idx, score in zip(indexes[0], scores[0]):
+            # idx is already a dict containing the document information
+            text_node = TextNode(
+                text=idx["text"],
+                node_id=idx["id"],
+                metadata={k: v for k, v in idx.items() if k not in ["text", "id"]}
+            )
+            # Create a NodeWithScore from the TextNode
+            node_with_score = NodeWithScore(node=text_node, score=score)
+            nodes_with_scores.append(node_with_score)
 
-        nodes: List[NodeWithScore] = []
-        for idx, score in zip(indexes, scores):
-            # idx can be an int or a dict of the node
-            if isinstance(idx, dict):
-                node = metadata_dict_to_node(idx)
-            else:
-                node_dict = self.corpus[int(idx)]
-                node = metadata_dict_to_node(node_dict)
+        return nodes_with_scores
 
-            # Ensure doc_id is set
-            if 'doc_id' not in node.metadata and 'document_id' in node.metadata:
-                node.metadata['doc_id'] = node.metadata['document_id']
-
-            # Create NodeWithScore, ensuring doc_id is set
-            node_with_score = NodeWithScore(node=node, score=float(score))
-            if hasattr(node, 'doc_id'):
-                node_with_score.doc_id = node.doc_id
-            elif 'doc_id' in node.metadata:
-                node_with_score.doc_id = node.metadata['doc_id']
-
-            nodes.append(node_with_score)
-
-        return nodes
+    def retrieve(self, str_or_query_bundle: Union[str, QueryBundle]) -> List[Document]:
+        if isinstance(str_or_query_bundle, str):
+            return self._retrieve(QueryBundle(query_str=str_or_query_bundle))
+        documents = self._retrieve(str_or_query_bundle)
+        return documents

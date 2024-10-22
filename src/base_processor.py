@@ -1,56 +1,75 @@
-import logging
-from pydantic import BaseModel, Field
-from datetime import datetime
-import glob
-import os
-import pdfplumber
 import re
-import socket
-import pandas as pd
-from typing import Dict, Any
-from abc import ABC, abstractmethod
+import logging
+from typing import Any
+from abc import ABC
+from datetime import datetime
+import pdfplumber
+from src.soil_test_models import readings_to_exclude
 
-from src.soil_test_models import  readings_to_exclude
-
-from src.logging_config import setup_logging
-
-setup_logging()
 logger = logging.getLogger(__name__)
-
-# Pydantic model for name mapping
-class NameMappingModel(BaseModel):
-    # Define fields based on the structure of name_mapping.json
-    # Using Dict[str, str] to represent key-value pairs
-    mapping: Dict[str, str] = Field(...)
-
 
 class BaseProcessor(ABC):
     def __init__(self) -> None:
         pass
 
-    @abstractmethod
-    def process_pdf(self, pdf_file: str) -> None:
-        pass
+    def _parse_section(self, table: list[list[str | None]], report_model, row_range: tuple[int, int], value_col: int, field_name_col: int = 1) -> dict[str, Any]:
+        '''
+        Parses a section from the table list and extracts the data for a given report model. The section parsed depends on the row_range. The table list was built using the pdfplumber library extracting results from either a mehlic-3 or saturated paste soil test report.
+        Args:
+            table (list[list[str]]): The rows from the the PDF soil test report.  It was built using the pdfplumber library.
+            report_model (BaseModel): This is either the Pydantic model for the M3 report or the SP report.
+            row_range (tuple[int, int]): The range of rows in the table listto parse.
+            value_col (int): The column index containing the values.
+            field_name_col (int, optional): The column index containing the field names. Defaults to 1.
 
-    def _store_markdown_file(self, measurement_name, df, pdf_file) -> None:
-        timestamp_ns = self._extract_timestamp_from_pdf(pdf_file)
-        yaml_content = self._build_yaml_content(measurement_name, df, timestamp_ns)
-        # Write the file out to the same directory as the location of pdf file.
-        directory = os.path.dirname(pdf_file)
-        self._write_obsidian_page(directory, yaml_content)
+        Returns:
+            dict[str, Any]: The parsed data.
+        '''
+        # The field_aliases dictionary maps the names (e.g.:'pH of Soil Sample' to the property name (e.g.: 'ph'))
+        field_aliases = {self._normalize_field_name(field.alias): name for name, field in report_model.__fields__.items()}
+        parsed_data = {}
+        current_field_name = None
+        row_index = row_range[0]
+        while row_index <row_range[1]:
+            row = table[row_index]
+            if len(row) > field_name_col and row[field_name_col]:
+                current_field_name = self._normalize_field_name(row[field_name_col].strip())
 
-    def _get_pdf_files(self, pdf_dir_or_file):
-        return (
-            glob.glob(pdf_dir_or_file + "/*.pdf")
-            if os.path.isdir(pdf_dir_or_file)
-            else [pdf_dir_or_file]
-            if os.path.isfile(pdf_dir_or_file)
-            else None
-        )
+            value = row[value_col].strip() if len(row) > value_col and row[value_col] else None
 
-    def _is_file_like(self, obj):
-        file_methods = ["read", "write", "seek", "tell", "close"]
-        return all(hasattr(obj, method) for method in file_methods)
+            # Skip excluded fields or empty field names
+            if not current_field_name or current_field_name in readings_to_exclude or value is None:
+                row_index += 1
+                continue
+
+            # Only check for meq value if the field name matches a soluble cation
+            if current_field_name in ["CALCIUM", "MAGNESIUM", "POTASSIUM:", "SODIUM"]:
+                # Store ppm value
+                if current_field_name in field_aliases:
+                    mapped_field_name = field_aliases[current_field_name]
+                    parsed_data[mapped_field_name] = value
+
+                # Check next row for meq value\
+                row_index += 1
+                if row_index  < row_range[1]:
+                    next_row = table[row_index ]
+                    if len(next_row) > value_col and 'meq' in next_row[value_col-1].lower():
+                        meq_value = next_row[value_col].strip()
+                        meq_field_name = f"{current_field_name.lower()}_meq"
+                        if meq_field_name in report_model.__fields__:
+                            parsed_data[meq_field_name] = meq_value
+            else:
+                if current_field_name in field_aliases:
+                    mapped_field_name = field_aliases[current_field_name]
+                    parsed_data[mapped_field_name] = value
+            row_index += 1
+        parsed_data = self._convert_float_strs_to_float(parsed_data)
+        return parsed_data
+
+    def _normalize_field_name(self, field_name: str) -> str:
+        if not field_name:
+            return ""
+        return re.sub(r'\s+', ' ', field_name).strip()
 
     def _extract_date_from_pdf(self, pdf_file) -> str:
         # Extract date from the PDF text
@@ -71,117 +90,20 @@ class BaseProcessor(ABC):
         # Ensure only the date string is returned without any time component
         return iso_date_str
 
-    def is_numeric_string(self, item):
-        """
-        Check if the item is an integer, a float, or a string that contains only digits and/or periods
-        """
-        if isinstance(item, (int, float)):
-            return True
-        elif isinstance(item, str):
-            return all(char.isdigit() or char == '.' for char in item)
-        else:
-            return False
-
-    def _build_dataFrame(
-        self, field_names: list, values: list, pdf_file: str
-    ) -> pd.DataFrame:
-        values = self._convert_float_strs_to_float(values)
-        return pd.DataFrame([values], columns=field_names)
-
-    def _build_yaml_content(
-        self, measurement_name: str, df: pd.DataFrame, timestamp_ns: int
-    ) -> str:
-        data = df.iloc[0]
-        fields = ",".join([f"{key}={value}" for key, value in data.items()])
-        line_protocol = f"{measurement_name} {fields} {timestamp_ns}"
-        return line_protocol
-
-    def _parse_header(self, table, field_aliases, nRows, value_row):
-        part_of_soil_test_dict = {}
-        for i, row in enumerate(table):
-            # Break if the specified number of rows is reached
-            if i >= nRows:
-                break
-
-            field_name = row[0].strip() if row[0] else None
-            # Exclude certain fields based on configuration
-            if not field_name or field_name in readings_to_exclude:
-                continue
-
-            # Clean and validate value
-            value = row[value_row]
-
-            # Map field names and accumulate values if valid
-            if field_name and value is not None:
-                mapped_field_name = field_aliases[field_name]
-                part_of_soil_test_dict[mapped_field_name] = value
-
-        return part_of_soil_test_dict
-
-    def _parse_bottom(self, table, field_aliases, value_col, row_begin):
-        part_of_soil_test_dict = {}
-        for row in table[row_begin:]:
-            field_name = row[1]
-            value = (row[value_col] if row[value_col] else None )
-            if field_name and value is not None:
-                mapped_field_name = field_aliases[field_name]
-                part_of_soil_test_dict[mapped_field_name] = value
-        return part_of_soil_test_dict
-
-    def _write_row(self, line_protocol: str) -> None:
-        # Create a UDP socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Default to the "SP" port, change to "M3" if "M3" is found in the string
-        udp_port = (
-            soil_results_config["udp_ports"]["M3"]
-            if "M3" in line_protocol
-            else soil_results_config["udp_ports"]["SP"]
-        )
-        # Send bytes
-        try:
-            # Send data
-            sock.sendto(line_protocol.encode(), ("gus.local", udp_port))
-        finally:
-            sock.close()
-
-    def _write_obsidian_page(self, directory: str, content: str) -> None:
-        # Split the content into individual test results
-        # Extract the measurement name and date
-        # measurement_mapping = {"SP": "Saturated Paste", "M3": "Mehlich 3"}
-        raw_measurement_name = content.split(" ")[0]
-        # measurement_name = measurement_mapping.get(
-        #     raw_measurement_name, raw_measurement_name
-        # )  # Default to raw name if not found in mapping
-        date = re.search(r"\d{4}-\d{2}-\d{2}", content).group()
-        if raw_measurement_name == "M3":
-            test_name = "Mehlic-3"
-        elif raw_measurement_name == "SP":
-            test_name = "Saturated_Paste"
-        else:
-            test_name = raw_measurement_name
-        filename = os.path.join(directory, f"{test_name}_{date}.md")
-        # Create a Markdown table header with measurement name and date
-        properties = f"---\ntags: {raw_measurement_name} {test_name} soil_test\n"
-        properties += f"date: {date}\n"
-
-        # Process each test result
-        # Splitting the content string into parts
-        parts = content.split(',')
-        # remove date from parts.
-        parts[-1] = parts[-1].split(' ',1)[0]
-        # Extracting and removing the date from the last part
-        # date_part = parts[-1].split(' ')[-1]
-        # parts[-1] = parts[-1].replace(' ' + date_part, '')
-
-        # # Adjusting the first element to remove the measurement abbreviation (M3 or SP).
-        # parts[0] = parts[0].replace(raw_measurement_name, '')
-        test_results = parts
-        for result in test_results:
-            test, value = result.split("=")
-            if raw_measurement_name in test:
-                test = test.replace(raw_measurement_name + ' ', '')
-            properties += f"{test} : {value} \n"
-        properties += "---\n"
-        # Output (or save) the markdown table
-        with open(filename, "w") as file:
-            file.write(properties)
+    def _convert_float_strs_to_float(self,data: dict[str, Any]) -> dict[str, Any]:
+        converted_data = {}
+        for key, value in data.items():
+            if isinstance(value, str) and key != 'sample_date':
+                try:
+                    # Handle cases like '>20'
+                    if value.startswith(('>', '<')):
+                        converted_value = float(value[1:])
+                    else:
+                        converted_value = float(value.replace(',', ''))
+                    converted_data[key] = converted_value
+                except ValueError:
+                    logging.warning(f"Unable to convert field '{key}' with value '{value}' to float.")
+                    converted_data[key] = value  # Keep original value if conversion fails
+            else:
+                converted_data[key] = value  # Keep original value if not a string
+        return converted_data
