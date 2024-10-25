@@ -8,6 +8,34 @@ from rich import print
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+def print_node_scores(nodes):
+    """
+    Print scores for all nodes, sorted from highest to lowest.
+
+    Args:
+    nodes (list): List of node objects.
+    """
+    # Create a list of tuples (index, score) for nodes with scores
+    scored_nodes = []
+    for index, node in enumerate(nodes):
+        if hasattr(node, 'score') and node.score is not None:
+            scored_nodes.append((index, node.score))
+        else:
+            logger.warning(f"Node at index {index} has no score attribute or score is None.")
+
+    # Sort the list based on scores in descending order
+    scored_nodes.sort(key=lambda x: x[1], reverse=True)
+
+    # Print the sorted scores
+    print("Node scores from highest to lowest:")
+    for index, score in scored_nodes:
+        logger.info(f"Node {index}: Score = {score}")
+
+    # Print summary
+    print(f"Total nodes: {len(nodes)}")
+    print(f"Nodes with scores: {len(scored_nodes)}")
+    print(f"Nodes without scores: {len(nodes) - len(scored_nodes)}")
+
 def create_node_viewer(nodes):
     def format_metadata(metadata):
         formatted = "Metadata:\n"
@@ -30,14 +58,6 @@ def create_node_viewer(nodes):
                 f"Node {index + 1} of {len(nodes)}",
                 index
             )
-
-            # Print out the return values
-            print("Return values from show_node:")
-            print(f"Content: {return_values[0][:10]}...")
-            print(f"Metadata: {return_values[1][:10]}...")
-            print(f"Score: {return_values[2]}")
-            print(f"Index display: {return_values[3]}")
-            print(f"Index: {return_values[4]}")
             return return_values
 
         except Exception as e:

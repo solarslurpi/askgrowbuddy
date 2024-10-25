@@ -4,19 +4,18 @@ import re
 from typing import List
 import dotenv
 import chromadb
-import ollama
 
 from langchain_community.document_loaders import ObsidianLoader
 from langchain.text_splitter import MarkdownHeaderTextSplitter
 from llama_index.core import Document as LlamaIndexDocument
-from llama_index.core import VectorStoreIndex
-from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 from llama_index.core import PropertyGraphIndex
 from llama_index.llms.ollama import Ollama
 from src.ollama_embedding import OllamaEmbedding
 from llama_index.core import Settings
 from llama_index.core.schema import TextNode
+import chromadb
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 
 from src.logging_config import setup_logging
@@ -75,16 +74,21 @@ class IngestService:
                 raise ValueError(f"Directory does not exist: {dir_or_list}")
             loader = ObsidianLoader(path=dir_or_list, collect_metadata=True)
             langchain_docs = loader.load()
-            docs = [
-                LlamaIndexDocument(
-                    text=self._remove_timestamp_blocks(doc.page_content),
-                    metadata=doc.metadata
-                )
-                # LlamaIndexDocument.from_langchain_format(doc)
-                for doc in langchain_docs
-            ]
-
+            seen_names = {}
+            unique_docs = []
+            for doc in langchain_docs:
+                name = doc.metadata.get("source", "").lower()
+                if "excalidraw" not in name and name not in seen_names:
+                    unique_docs.append(
+                        LlamaIndexDocument(
+                            text=self._remove_timestamp_blocks(doc.page_content),
+                            metadata=doc.metadata
+                        )
+                    )
+                    seen_names[name] = True
+            docs = unique_docs
         return docs
+
     def _remove_timestamp_blocks(self, text: str) -> str:
         '''Many notes have a timestamp codeblock interspersed in the text to support YouTube playback. This function removes them.'''
 
@@ -117,7 +121,7 @@ class IngestService:
             raise ValueError("No text chunks generated.")
         return nodes
 
-    def build_vector_index(self, nodes: list[LlamaIndexDocument], embed_model_name: str = 'nomic-embed-text', collection_name: str = 'vectorstore', persist_dir: str = 'vectorstore'):
+    def build_vector_index(self, nodes: list[LlamaIndexDocument], collection_name: str = 'vectorstore', embed_model_name: str = 'multi-qa-mpnet-base-cos-v1' ):
         '''Creates a vector index for the given document nodes.'''
         try:
             logger.info(f"Starting to build vector index with embedding model: {embed_model_name}")
@@ -128,40 +132,32 @@ class IngestService:
             logger.debug(f"Number of documentnodes to process: {len(nodes)}")
 
             # Create Chromadb collection from the nodes
-            our_collection = self.create_collection(docs=nodes, collection=collection_name, embedding_model_name= embed_model_name)
+            embedding_function = SentenceTransformerEmbeddingFunction(model_name=embed_model_name)
+            existing_collections = self.client.list_collections()
+            if any(collection.name == collection_name for collection in existing_collections):
+                self.client.delete_collection(collection_name)
+                logger.debug(f"Collection {collection_name} has been deleted.")
+            our_collection = self.client.create_collection( collection_name,embedding_function=embedding_function, metadata={"hnsw:space": "cosine"})
+            ids = [str(i) for i in range(len(nodes))]
+            documents = [node.text for node in nodes]
+            metadata_list = [node.metadata for node in nodes]
+            our_collection.add(ids=ids, documents=documents, metadatas = metadata_list)
             logger.debug(f"Created collection '{collection_name}' with {our_collection.count()} document nodes")
-
-            chroma_vector_store = ChromaVectorStore(chroma_collection=our_collection, persist_dir=persist_dir)
-            logger.debug(f"Created ChromaVectorStore with persist directory: {persist_dir}")
-
-            # Create a VectorStoreIndex using the ChromaVectorStore
-            vector_index = VectorStoreIndex.from_vector_store(chroma_vector_store)
-            logger.info(f"Successfully built vector index for collection '{collection_name}'")
-
-            return vector_index
-
-        except ValueError as ve:
-            logger.error(f"ValueError in build_vector_index: {str(ve)}")
-            raise
+            return our_collection
         except Exception as e:
             logger.error(f"Unexpected error in build_vector_index: {str(e)}", exc_info=True)
             raise
 
-    def get_vector_index(self, collection_name: str = 'vectorstore', persist_dir: str = 'vectorstore'):
+    def get_vector_index(self, collection_name: str = None):
+        if not collection_name:
+            raise ValueError("No collection name provided.")
         try:
             logger.info(f"Attempting to get vector index for collection '{collection_name}'")
 
-            our_collection = self.get_collection(collection_name)
+            our_collection = self.client.get_collection(name=collection_name)
             logger.debug(f"Retrieved collection '{collection_name}'")
 
-            chroma_vector_store = ChromaVectorStore(chroma_collection=our_collection, persist_dir=persist_dir)
-            logger.debug(f"Retrieved ChromaVectorStore with persist directory: {persist_dir}")
-
-            # Create a VectorStoreIndex using the ChromaVectorStore
-            vector_index = VectorStoreIndex.from_vector_store(chroma_vector_store)
-            logger.info(f"Successfully loaded vector index for collection '{collection_name}'")
-
-            return vector_index
+            return our_collection
         except ValueError as ve:
             logger.error(f"ValueError in get_vector_index: {str(ve)}")
             raise
@@ -310,57 +306,6 @@ class IngestService:
             logger.error(f"Error getting collection '{collection}'",exc_info=True)
             raise e
 
-    def create_collection(self,
-                          docs:list[LlamaIndexDocument]=None, # type: ignore
-                          collection: str=None,  # type: ignore
-                          collection_metadata:dict=None, # type: ignore
-                          embedding_model_name:str='all-minilm') -> chromadb.Collection:
-        """
-        Create a ChromaDB collection with document content and embeddings.
-
-        Args:
-            docs (list[LlamaIndexDocument]): Documents to store.
-            collection (str): Name of the collection to create.
-            collection_metadata (dict, optional): Metadata for the collection.
-            embedding_model (str, optional): Model to use for generating embeddings. Defaults to 'all-minilm'.
-
-        Returns:
-            chromadb.Collection: The created ChromaDB collection.
-
-        Raises:
-            ValueError: If no documents are provided or no collection name is given.
-
-        Note:
-            If the collection already exists, it will be deleted and recreated.
-        """
-        logger.debug(f"Storing documents in ChromaDB collection: {collection}")
-        if not docs:
-            raise ValueError("No documents to store.")
-        if not collection:
-            raise ValueError("No collection name provided.")
-        # First delete the collection if it already exists
-        if any(name == collection for name, _ in self.collections_name_and_metadata()):
-            self.delete_collection(collection)
-        # Create a new collection
-        collection = self.client.create_collection(name=collection, metadata=collection_metadata)
-        # store each document
-        for i, d in enumerate(docs):
-            response = ollama.embeddings(model=embedding_model_name, prompt=d.text)
-            embedding = response["embedding"]
-            # Build the parameters dictionary
-            params = {
-                "ids": [str(i)],
-                "embeddings": [embedding],
-                "documents": [d.text]
-            }
-            # Conditionally add metadatas if it is not None and not empty
-            if d.metadata:
-                params["metadatas"] = [d.metadata]
-            collection.add(**params)
-
-        logger.info(f"Created collection '{collection}' with {len(docs)} documents.")
-        return collection
-
     def collection_count(self,collection:str) -> int:
         '''Returns the number of documents in the collection.'''
 
@@ -390,15 +335,7 @@ class IngestService:
 
         # print(f"Added {len(docs)} documents to collection '{collection_name}'. Total documents: {collection.count()}")
 
-    def delete_collection(self, collection_name: str):
-        try:
-            self.client.delete_collection(name=collection_name)
-            message = f"Collection '{collection_name}' has been deleted."
-        except ValueError as e:
-            logger.error(f"Error deleting collection '{collection_name}",exc_info=True)
-            raise e
-        logger.debug(message)
-        return message
+
 
     def collections_name_and_metadata(self) -> list[str]:
         '''Returns a list of tuples where each tuple contains a collection name and its corresponding metadata.'''
