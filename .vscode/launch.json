@@ -9,6 +9,7 @@
       "console": "integratedTerminal",
       "justMyCode": false
     },
+
     {
       "name": "Python: Jupyter",
       "type": "python",

@@ -6,7 +6,7 @@ from llama_index.core import Document as LlamaIndexDocument
 
 class DocStats:
     @classmethod
-    def print_llama_index_docs_summary_stats(cls, documents: List[LlamaIndexDocument]) -> Dict[str, Any]:
+    def print_llama_index_docs_summary_stats(cls, documents: List[Any]) -> Dict[str, Any]:
         """
         Generate summary statistics for the ingested documents and print them in a table format.
 

@@ -67,11 +67,11 @@ def create_node_viewer(nodes):
 
     def navigate(direction, current_index):
         new_index = (int(current_index) + direction) % len(nodes)
-        logger.info(f"Navigating to node {new_index}")
+        logger.debug(f"Navigating to node {new_index}")
         return show_node(new_index)
 
     def delete_node(current_index):
-        logger.info(f"Deleting node at index {current_index}")
+        logger.debug(f"Deleting node at index {current_index}")
         del nodes[current_index]
         new_index = min(current_index, len(nodes) - 1)
         return show_node(new_index) + (f"{len(nodes)} nodes remaining",)

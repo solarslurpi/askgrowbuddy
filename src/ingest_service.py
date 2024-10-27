@@ -1,7 +1,8 @@
+import hashlib
 import logging
 import os
 import re
-from typing import List
+from typing import List, Tuple
 import dotenv
 import chromadb
 
@@ -58,7 +59,7 @@ class IngestService:
             self._client = chromadb.PersistentClient(path=self.persistent_directory)
         return self._client
 
-    def load_obsidian_notes(self, dir_or_list:str|list) -> list[LlamaIndexDocument]:
+    def load_obsidian_notes(self, dir_or_list:str|list, min_content_length:int=30) -> list[LlamaIndexDocument]:
         '''Uses Langchain's Obsidian Loader to load in the text found within the directory (and sub directories) or a list of strings in Document objects. Returns a list of **Llamaindex** Documents because the RAG pipeline uses Llamaindex.'''
         logger.debug(f"Loading documents from: {dir_or_list}")
         docs = None
@@ -75,19 +76,34 @@ class IngestService:
             loader = ObsidianLoader(path=dir_or_list, collect_metadata=True)
             langchain_docs = loader.load()
             seen_names = {}
+            seen_contents = {}
             unique_docs = []
             for doc in langchain_docs:
                 name = doc.metadata.get("source", "").lower()
-                if "excalidraw" not in name and name not in seen_names:
-                    unique_docs.append(
-                        LlamaIndexDocument(
-                            text=self._remove_timestamp_blocks(doc.page_content),
-                            metadata=doc.metadata
+                if "excalidraw" not in name and not self._is_excalidraw_document(doc.metadata):
+                    cleaned_content = self._remove_timestamp_blocks(doc.page_content)
+                    content_hash = hashlib.md5(cleaned_content.encode()).hexdigest()
+                    # Check for duplicate content and content lengths that are too short to have meaningful content.
+                    if (content_hash not in seen_contents and
+                        name not in seen_names):
+                        unique_docs.append(
+                            LlamaIndexDocument(
+                                text=cleaned_content,  # Store the full content including headers
+                                metadata=doc.metadata
+                            )
                         )
-                    )
-                    seen_names[name] = True
+                        seen_names[name] = True
+                        seen_contents[content_hash] = True
             docs = unique_docs
         return docs
+
+    def _is_excalidraw_document(self,metadata):
+        return any([
+            'excalidraw' in metadata.get('source', '').lower(),
+            'excalidraw' in metadata.get('path', '').lower(),
+            metadata.get('tags') == 'excalidraw',
+            metadata.get('excalidraw-plugin') == 'parsed'
+        ])
 
     def _remove_timestamp_blocks(self, text: str) -> str:
         '''Many notes have a timestamp codeblock interspersed in the text to support YouTube playback. This function removes them.'''
@@ -96,7 +112,56 @@ class IngestService:
         pattern = r'```timestamp(?:-url)?\n.*?\n```'
         return re.sub(pattern, '', text)
 
-    def chunk_text(self, docs: list[LlamaIndexDocument]) -> list[TextNode]:
+    def _get_meaningful_content(self, text: str) -> str:
+        """Filter out non-meaningful content while preserving searchable terms from tags and images."""
+        if text is None:
+            return ""
+
+        def clean_tags(line: str) -> str:
+            """Remove tag symbols but keep the words."""
+            words = []
+            for word in line.split():
+                if word.startswith('#'):
+                    words.append(word[1:])
+                else:
+                    words.append(word)
+            return ' '.join(words)
+
+        def clean_line_with_image(line: str) -> str:
+            """Clean a line that might contain both text and image tags."""
+            # Remove image markdown and extract remaining text
+            text_parts = re.split(r'!\[\[.*?\]\]', line)
+            # Join and clean the remaining text parts
+            cleaned_text = ' '.join(part.strip() for part in text_parts if part.strip())
+            return clean_tags(cleaned_text) if cleaned_text else ''
+
+        meaningful_lines = []
+        for line in text.splitlines():
+            line = line.strip()
+
+            # Skip empty lines
+            if not line:
+                continue
+
+            # Skip headers
+            if re.match(r'^#\s+', line):
+                continue
+
+            # Handle lines with images
+            if '![[' in line:
+                cleaned_line = clean_line_with_image(line)
+                if cleaned_line:  # Only add if there's text besides the image
+                    meaningful_lines.append(cleaned_line)
+                continue
+
+            # Clean tags from the line
+            cleaned_line = clean_tags(line)
+            if cleaned_line:  # Add if there's content after cleaning
+                meaningful_lines.append(cleaned_line)
+
+        return '\n'.join(meaningful_lines)
+
+    def chunk_text(self, docs: list[LlamaIndexDocument], min_content_length:int=30) -> list[TextNode]:
         headers_to_split_on = [
             ("#", "Header 1"),
             # ("##", "Header 2"),
@@ -109,27 +174,28 @@ class IngestService:
             note_metadata = doc.metadata
             langchain_nodes = splitter.split_text(note_text)
 
-            # Convert Langchain nodes to LlamaIndex TextNodes
+            # Convert Langchain nodes to LlamaIndex TextNodes, filtering out header-only content
             nodes.extend([
                 TextNode(
                     text=node.page_content,
                     metadata={**node.metadata, **note_metadata}
                 )
                 for node in langchain_nodes
+                if len(self._get_meaningful_content(node.page_content)) > min_content_length
             ])
         if not nodes:
             raise ValueError("No text chunks generated.")
         return nodes
 
     def build_vector_index(self, nodes: list[LlamaIndexDocument], collection_name: str = 'vectorstore', embed_model_name: str = 'multi-qa-mpnet-base-cos-v1' ):
-        '''Creates a vector index for the given document nodes.'''
+        '''Creates a vector index for the given document nodes. The distance metric is set to cosine similarity.'''
         try:
             logger.info(f"Starting to build vector index with embedding model: {embed_model_name}")
 
             if not nodes:
-                raise ValueError("No document nodes provided to build the vector index.")
+                raise ValueError("No nodes provided to build the vector index.")
 
-            logger.debug(f"Number of documentnodes to process: {len(nodes)}")
+            logger.debug(f"Number of nodes to process: {len(nodes)}")
 
             # Create Chromadb collection from the nodes
             embedding_function = SentenceTransformerEmbeddingFunction(model_name=embed_model_name)
@@ -137,6 +203,7 @@ class IngestService:
             if any(collection.name == collection_name for collection in existing_collections):
                 self.client.delete_collection(collection_name)
                 logger.debug(f"Collection {collection_name} has been deleted.")
+            # Setting the hnsw namespace to "cosine" returns the cosine distance.  I could use "ip" to return the inner product, but it seems to return the same results.
             our_collection = self.client.create_collection( collection_name,embedding_function=embedding_function, metadata={"hnsw:space": "cosine"})
             ids = [str(i) for i in range(len(nodes))]
             documents = [node.text for node in nodes]
@@ -305,41 +372,3 @@ class IngestService:
         except ValueError as e:
             logger.error(f"Error getting collection '{collection}'",exc_info=True)
             raise e
-
-    def collection_count(self,collection:str) -> int:
-        '''Returns the number of documents in the collection.'''
-
-        collection = self.client.get_collection(name=collection)
-        return collection.count()
-
-    # def add_documents(self, collection_name: str, docs: list[str], e_model: str = 'all-minilm'):
-    #     collection = self.client.get_collection(name=collection)
-
-    #     # Get the current count of documents in the collection
-    #     current_count = collection.count()
-
-    #     # Extract page content from each document
-    #     doc_texts = [doc.page_content for doc in docs]
-    #     metadatas = [doc.metadata for doc in docs]
-    #     # Generate embeddings for each document
-    #     embeddings = [self.generate_embedding(doc, e_model) for doc in doc_texts]
-
-
-        # # Add new documents to the collection
-        # collection.add(
-        #     documents=doc_texts,
-        #     ids=[f"doc_{i}" for i in range(current_count, current_count + len(docs))],
-        #     metadatas=metadatas,
-        #     embeddings=embeddings
-        # )
-
-        # print(f"Added {len(docs)} documents to collection '{collection_name}'. Total documents: {collection.count()}")
-
-
-
-    def collections_name_and_metadata(self) -> list[str]:
-        '''Returns a list of tuples where each tuple contains a collection name and its corresponding metadata.'''
-        collections = self.client.list_collections()
-        collection_names = [collection.name for collection in collections]
-        collection_metadatas = [collection.metadata for collection in collections]
-        return list(zip(collection_names, collection_metadatas))
