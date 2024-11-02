@@ -65,3 +65,4 @@ version = ">=v2.2.6"
 
 [[tool.poetry.packages]]
 include = "llama_index/"
+PromptTemplate

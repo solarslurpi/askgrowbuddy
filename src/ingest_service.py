@@ -2,8 +2,7 @@ import hashlib
 import logging
 import os
 import re
-from typing import List, Tuple
-import dotenv
+from typing import List
 import chromadb
 
 from langchain_community.document_loaders import ObsidianLoader
@@ -12,8 +11,8 @@ from llama_index.core import Document as LlamaIndexDocument
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 from llama_index.core import PropertyGraphIndex
 from llama_index.llms.ollama import Ollama
-from src.ollama_embedding import OllamaEmbedding
-from llama_index.core import Settings
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
 from llama_index.core.schema import TextNode
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
@@ -22,7 +21,6 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 from src.logging_config import setup_logging
 from src.bm25_retriever_code import BM25Retriever
 
-dotenv.load_dotenv()
 setup_logging()
 logger = logging.getLogger(__name__)
 
@@ -39,27 +37,11 @@ class IngestService:
     The class provides methods for each step of the process, allowing for flexible usage
     and easy integration with other components of a document processing pipeline.
     """
-    def __init__(self,persisitent_directory:str="vectorstore"):
-        self.persistent_directory = persisitent_directory
-        self._client = None # Holds chromadb client when needed.
-        logger.debug(f"Persistent directory for storing vectorized documents: {self.persistent_directory}")
+    def __init__(self):
+        pass
 
-        Settings.embed_model = OllamaEmbedding(
-            model_name='nomic-embed-text',
-            base_url="http://localhost:11434",
-            ollama_additional_kwargs={"mirostat": 0},
-        )
-        # Choose your LLM...
-        Settings.llm = Ollama(model='mistral', request_timeout=100.0)
 
-    @property
-    def client(self):
-        # Instantiate when needed.
-        if self._client is None:
-            self._client = chromadb.PersistentClient(path=self.persistent_directory)
-        return self._client
-
-    def load_obsidian_notes(self, dir_or_list:str|list, min_content_length:int=30) -> list[LlamaIndexDocument]:
+    def load_obsidian_notes(self, dir_or_list:str|list) -> list[LlamaIndexDocument]:
         '''Uses Langchain's Obsidian Loader to load in the text found within the directory (and sub directories) or a list of strings in Document objects. Returns a list of **Llamaindex** Documents because the RAG pipeline uses Llamaindex.'''
         logger.debug(f"Loading documents from: {dir_or_list}")
         docs = None
@@ -187,24 +169,22 @@ class IngestService:
             raise ValueError("No text chunks generated.")
         return nodes
 
-    def build_vector_index(self, nodes: list[LlamaIndexDocument], collection_name: str = 'vectorstore', embed_model_name: str = 'multi-qa-mpnet-base-cos-v1' ):
+    def build_vector_index(self, nodes: list[LlamaIndexDocument], collection_name: str = 'vectorstore', embed_model_name: str = 'multi-qa-mpnet-base-cos-v1', persistent_directory:str='vectorstore' ):
         '''Creates a vector index for the given document nodes. The distance metric is set to cosine similarity.'''
         try:
             logger.info(f"Starting to build vector index with embedding model: {embed_model_name}")
 
             if not nodes:
                 raise ValueError("No nodes provided to build the vector index.")
-
-            logger.debug(f"Number of nodes to process: {len(nodes)}")
-
+            chroma_client = chromadb.PersistentClient(path=persistent_directory)
             # Create Chromadb collection from the nodes
             embedding_function = SentenceTransformerEmbeddingFunction(model_name=embed_model_name)
-            existing_collections = self.client.list_collections()
+            existing_collections = chroma_client.list_collections()
             if any(collection.name == collection_name for collection in existing_collections):
-                self.client.delete_collection(collection_name)
+                chroma_client.delete_collection(collection_name)
                 logger.debug(f"Collection {collection_name} has been deleted.")
             # Setting the hnsw namespace to "cosine" returns the cosine distance.  I could use "ip" to return the inner product, but it seems to return the same results.
-            our_collection = self.client.create_collection( collection_name,embedding_function=embedding_function, metadata={"hnsw:space": "cosine"})
+            our_collection = chroma_client.create_collection( collection_name,embedding_function=embedding_function, metadata={"hnsw:space": "cosine"})
             ids = [str(i) for i in range(len(nodes))]
             documents = [node.text for node in nodes]
             metadata_list = [node.metadata for node in nodes]
@@ -215,90 +195,6 @@ class IngestService:
             logger.error(f"Unexpected error in build_vector_index: {str(e)}", exc_info=True)
             raise
 
-    def get_vector_index(self, collection_name: str = None):
-        if not collection_name:
-            raise ValueError("No collection name provided.")
-        try:
-            logger.info(f"Attempting to get vector index for collection '{collection_name}'")
-
-            our_collection = self.client.get_collection(name=collection_name)
-            logger.debug(f"Retrieved collection '{collection_name}'")
-
-            return our_collection
-        except ValueError as ve:
-            logger.error(f"ValueError in get_vector_index: {str(ve)}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error in get_vector_index: {str(e)}", exc_info=True)
-            raise
-
-    def build_knowledge_graph(self, documents: List[LlamaIndexDocument], user="neo4j", password=None, embed_model_name='nomic-embed-text', model_name: str = 'mistral') -> PropertyGraphIndex:
-        try:
-            logger.info(f"Starting to build knowledge graph with {len(documents)} documents")
-
-            graph_store = self._get_graph_store(user, password)
-            logger.debug("Graph store initialized")
-
-            llm = Ollama(model=model_name, request_timeout=100.0)
-            logger.debug(f"LLM initialized with model: {model_name}")
-
-            embed_model = self._get_embed_model(embed_model_name)
-            logger.debug(f"Embedding model initialized: {embed_model_name}")
-
-            # Create a Knowledge Graph Index.
-            kg_index = PropertyGraphIndex.from_documents(
-                documents,
-                embed_model=embed_model,
-                llm=llm,
-                property_graph_store=graph_store,
-                show_progress=True,
-            )
-            logger.info("Knowledge graph index successfully created")
-
-            return kg_index
-
-        except ValueError as ve:
-            logger.error(f"ValueError in build_knowledge_graph: {str(ve)}")
-            raise
-        except AttributeError as ae:
-            logger.error(f"AttributeError in build_knowledge_graph: {str(ae)}. Ensure documents are of correct type.")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error in build_knowledge_graph: {str(e)}", exc_info=True)
-            raise
-
-    def get_knowledge_graph(self, user="neo4j", password=None, embed_model_name='nomic-embed-text', model_name:str='mistral'):
-        try:
-            logger.info("Attempting to retrieve existing knowledge graph")
-
-            graph_store = self._get_graph_store(user, password)
-            logger.debug("Graph store initialized")
-
-            llm = Ollama(model=model_name, request_timeout=100.0)
-            logger.debug(f"LLM initialized with model: {model_name}")
-
-            embed_model = self._get_embed_model(embed_model_name)
-            logger.debug(f"Embedding model initialized: {embed_model_name}")
-
-            kg_index = PropertyGraphIndex.from_existing(
-                embed_model=embed_model,
-                llm=llm,
-                property_graph_store=graph_store,
-                show_progress=True,
-            )
-            logger.info("Existing knowledge graph successfully retrieved")
-
-            return kg_index
-
-        except ValueError as ve:
-            logger.error(f"ValueError in get_knowledge_graph: {str(ve)}")
-            raise
-        except ConnectionError as ce:
-            logger.error(f"ConnectionError in get_knowledge_graph: {str(ce)}. Check your database connection.")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error in get_knowledge_graph: {str(e)}", exc_info=True)
-            raise
 
     def build_bm25_retriever(self, nodes: List, persist_dir: str = "bm25_index", similarity_top_k: int = 5) -> BM25Retriever:
         try:
@@ -346,7 +242,7 @@ class IngestService:
             raise e
 
 
-    def _get_graph_store(self, user="neo4j", password=None, database:str='rag_database'):
+    def _get_graph_store(self, user="neo4j", password=None, graph_name:str='soiltestknowledge'):
         neo4j_uri = "bolt://localhost:7687"  # Update with your Neo4j instance details
         neo4j_user = user
         neo4j_password = password if password else os.getenv("NEO4J_PASSWORD") # type: ignore
@@ -354,16 +250,9 @@ class IngestService:
             username=neo4j_user,
             password=neo4j_password, # type: ignore
             url=neo4j_uri,
-            database=database,  # Use appropriate database name
+            database=graph_name,  # Use appropriate database name
         )
         return graph_store
-
-    def _get_embed_model(self, embed_model_name:str):
-        return OllamaEmbedding(
-            model_name=embed_model_name,
-            base_url="http://localhost:11434",
-            ollama_additional_kwargs={"mirostat": 0},
-        )
 
     def get_collection(self, collection:str) -> chromadb.Collection:
         '''Returns a collection object of a given name.'''

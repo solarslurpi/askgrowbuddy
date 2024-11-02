@@ -1,0 +1,4 @@
+
+[lint]
+select = ["E", "F", "B", "Q", "I", "N", "S", "BLE", "FBT", "A", "C4", "DTZ", "T10", "EM", "ISC", "ICN", "INP", "PIE", "T20", "PT", "Q", "RET", "SLF", "SIM", "TID", "ARG", "PTH", "PD", "PLC", "PLE", "PLR", "PLW", "TRY"]
+ignore = ["E501", "ARG002", "ISC001", "TRY300", "W0613", "E1128"]

@@ -21,8 +21,8 @@ class QueryResult(TypedDict):
 
 # Function to run a query with the retriever and custom prompt
 def ask_question(query: str, model_name='mistral'):
-    # Initialize the Ollama LLM
-    ollama_llm = Ollama(model=model_name)
+    # Initialize the Ollama LLM. Give it a long timeout to avoid timeouts
+    ollama_llm = Ollama(model=model_name,request_timeout=1000.0)
 
     # Create the message for Ollama's chat method
     # Note: The query might already include context from a previous step
