@@ -1,23 +1,42 @@
+import spacy
 
+nlp = spacy.load("en_core_web_sm")
 
-min_pH = 6.8
-max_pH = 6.9
-pH = m3_report.pH
+def print_detailed_analysis(text: str):
+    doc = nlp(text)
+    print(f"\nAnalyzing: {text}")
+    print("-" * 60)
+    print(f"{'Token':<15} {'Dep':<12} {'Head':<15} {'Children'}")
+    print("-" * 60)
+    for token in doc:
+        children = [child.text for child in token.children]
+        print(f"{token.text:<15} {token.dep_:<12} {token.head.text:<15} {children}")
 
-if pH < min_pH:
-    print("write a min pH prompt")
-elif pH > max_pH:
-    print("write a max pH prompt")
+test_sentences = [
+    "Calcium is taken up by the xylem to the leaves.",
+    "The ideal pH for growing Cannabis is between 6.8-6.9.",
+    "Plants that are deficient of phosphorus will display a reddish coloration.",
+    "High pH reduces iron uptake.",
+    "Nitrogen moves from the soil into the roots."
+]
 
-- get_nodes from chromadb using llamaindex retriever
-- write the prompt
-f"""You are a helpful assistant that analyzes mehlic-3 and saturated paste soil tests.  You focus on tests coming from Cannibis growers who grow in large containers that use a mixture of peat moss, compost, and perlite as their growing medium.  This soiless media is full of microbes that work with organic matter to provide nutrients to the plants.  The Cannibus grower comes to you with the pH value of their soil.  Your job is to write a reply to the grower with advice on what the pH value means and what to do about it.  You know the ideal pH for growing Cannabis in this soiless media is between 6.8 and 6.9.  You will use this knowledge as well as the additional notes provided:
+print("DETAILED DEPENDENCY ANALYSIS")
+print("=" * 60)
 
-PROVIDED NOTES: {provided_notes}
+for text in test_sentences:
+    print_detailed_analysis(text)
+    # Count SVO relationships
+    doc = nlp(text)
+    svo_count = len([sent for sent in doc.sents
+                    if any(tok.dep_ == "nsubj" for tok in sent)
+                    and any(tok.dep_ == "dobj" for tok in sent)])
 
-to provide a thoughtful reply to the grower with advice on what the pH value means and what to do about it if the value is outside the ideal range."""
+    # Additional analysis
+    subjects = [t for t in doc if t.dep_ in ("nsubj", "nsubjpass")]
+    objects = [t for t in doc if t.dep_ in ("dobj", "pobj")]
 
-Do RAG using the prompt.
-Write the analysis to a file.
-else:
-    print("Wonderful! The pH is within the sweet spot.")
+    print("\nAnalysis:")
+    print(f"SVO Count: {svo_count}")
+    print(f"Subjects found: {[t.text for t in subjects]}")
+    print(f"Objects found: {[t.text for t in objects]}")
+    print("=" * 60)

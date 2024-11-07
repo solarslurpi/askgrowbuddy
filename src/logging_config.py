@@ -1,6 +1,8 @@
 # src/logging_config.py
 import logging
 from pathlib import Path
+
+
 def setup_logging():
     # Create logs directory if it doesn't exist
     log_dir = Path("logs")
@@ -28,8 +30,10 @@ def setup_logging():
     logging.getLogger('httpx').setLevel(logging.WARNING)
     logging.getLogger('ipykernel').setLevel(logging.WARNING)
     logging.getLogger('query').setLevel(logging.DEBUG)
-    logging.getLogger('ingest_service').setLevel(logging.DEBUG)
-    logging.getLogger('eval_neo4j').setLevel(logging.DEBUG)
+    logging.getLogger('src.ingest_service').setLevel(logging.DEBUG)
+    logging.getLogger('src.token_tracking').setLevel(logging.DEBUG)
+    logging.getLogger('src.knowledge_graph').setLevel(logging.DEBUG)
+    logging.getLogger('src.ask_question').setLevel(logging.DEBUG)
 
     # You can add more specific logger configurations here if needed
     # For example:

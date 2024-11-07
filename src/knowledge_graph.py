@@ -8,16 +8,19 @@ from typing import Generator, Iterator, Optional, Tuple
 import spacy
 from llama_index.core.schema import NodeWithScore, TextNode
 from neo4j import GraphDatabase, Session
+from sentence_transformers import SentenceTransformer, util
 
 from src.ask_question import get_llm
 from src.logging_config import setup_logging
+from src.token_tracking import TokenTracker
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
 class BuildGraphIndex:
     def __init__(self):
-        pass
+        self.nlp = spacy.load("en_core_web_sm")
+        self.token_tracker = TokenTracker()
 
     def _get_triplet_extraction_prompt(self, max_triplets: int = 3) -> str:
         return f"""Some text is provided below. Extract up to {max_triplets} key knowledge triplets in (subject, predicate, object) format.
@@ -176,6 +179,7 @@ class BuildGraphIndex:
                 for line in response["answer"].strip().split("\n"):
                     triplet = self._parse_triplet(line)
                     if triplet and self._is_valid_neo4j_relationship_type(triplet[1].upper()):
+                        logger.debug(f"Extracted triplet: {triplet}")
                         triplets.append(triplet)
 
                 if triplets:  # If we have any valid triplets
@@ -202,16 +206,24 @@ class BuildGraphIndex:
         }
 
 
-    def _determine_max_triplets(self, text: str) -> int:
-        """Determine the number of triplets to extract from a text node based on the "richness" of the text. SpaCy is used to help detect number of main relationships.  The number of triplets is capped at 10. By starting with 1, we ensure that at least one triplet is extracted."""
-        nlp = spacy.load("en_core_web_sm")
-        doc = nlp(text)
 
-        # Count subject-verb-object relationships
-        svo_count = len([sent for sent in doc.sents
-                        if any(tok.dep_ == "nsubj" for tok in sent)
-                        and any(tok.dep_ == "dobj" for tok in sent)])
-        return min(svo_count + 1, 10)  # Cap at 10 triplets
+    def _determine_max_triplets(self, text: str) -> int:
+        """Determine the number of triplets to extract based on SpaCy's dependency parsing.
+
+        Args:
+            text: Input text to analyze
+
+        Returns:
+            int: Number of triplets to extract (minimum 1, maximum 10)
+        """
+        doc = self.nlp(text)
+
+        # Count relationships including passive voice and prepositional objects
+        relationship_count = len([sent for sent in doc.sents
+            if any(tok.dep_ in ("nsubj", "nsubjpass") for tok in sent)
+            and any(tok.dep_ in ("dobj", "pobj") for tok in sent)])
+
+        return min(relationship_count + 1, 10)  # Cap at 10 triplets
 
     def _insert_triplets_to_neo4j(self, node: TextNode, triplets: Iterator[Tuple[str, str, str]], session: Session) -> Generator[Tuple[str, str, str], None, None]:
         try:
@@ -331,172 +343,42 @@ class BuildGraphIndex:
             logger.info("Database connection closed")
 
 class RetrieveGraphNodes:
-    def __init__(self):
-        pass
+    def __init__(self, embed_model_name: str = 'multi-qa-mpnet-base-cos-v1'):
+        self.embed_model = SentenceTransformer(embed_model_name)
 
-    def _get_search_terms_prompt(self, text: str, max_terms: int = 5) -> str:
-        """Returns prompt template for extracting search terms from a query."""
-        return f"""Extract ONLY the most specific technical terms from the query. Maximum {max_terms} terms.
-
-    STRICT RULES - YOU MUST FOLLOW THESE:
-    1. ONLY INCLUDE:
-    - Words that are in the query
-    - Technical measurements (pH, EC, PPM, meq)
-    - Chemical names (N, P, K, calcium, magnesium)
-    - Specific soil properties (CEC, bulk density)
-    - Technical conditions (anaerobic, aerobic)
-
-    2. NEVER INCLUDE:
-    - Words that are not in the query
-    - The word 'cannabis' or 'marijuana'
-    - The word 'plant' or 'plants'
-    - The word 'soil' by itself
-    - The word 'ideal' or 'optimal'
-    - The word 'good' or 'best'
-    - The word 'grow' or 'growing'
-    - Any other generic descriptors
-
-    If no technical terms are found, return EMPTY string.
-    Return only comma-separated terms, no explanations.
-
-    Examples:
-    Query: What's the ideal pH range for cannabis in soil?
-    Terms: pH
-
-    Query: What are options for Calcium nutrients?
-    Terms: calcium, nutrients
-
-    Query: How to fix nitrogen deficiency in plants?
-    Terms: nitrogen, deficiency
-
-    Query: {text}
-    Terms:"""
-
-    def _extract_search_terms_llm(self, query: str, max_terms: int = 5, model_name: str = "mistral_soil") -> list[str]:
-        """Uses LLM to extract key search terms from query."""
-        prompt = self._get_search_terms_prompt(query, max_terms)
-        llm = get_llm(model_name)
-        response = llm.ask(prompt.format(text=query))
-        # Convert response to lowercase for comparison
-        query_lower = query.lower()
-
-        # Only accept terms that actually appear in the query
-        terms = [term.strip() for term in response["answer"].split(",") if term.strip()]
-        return [term for term in terms if term.lower() in query_lower]
-
-
-    def retrieve(self,search_terms: list[str], k: int = 5, max_score: float = 0.95):
+    def retrieve(self, query: str, database_name: str, k: int = 5) -> list[NodeWithScore]:
         """
-        Retrieve top k most relevant nodes based on graph relationships.
-        Returns list of NodeWithScore objects with text and metadata from Neo4j.
+        Retrieve nodes using sentence transformer embeddings.
         """
-        driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "asd@123qwe"))
-
+        driver = None
         try:
-            with driver.session(database="soiltestknowledge") as session:  # Check your database name!
-                # Debug: First check if we can find the entities
-                logger.info("Searching for entities...")
-                scoring_result = session.run("""
-                    MATCH (start:Entity)
-                    WHERE any(term IN $terms WHERE toLower(start.name) CONTAINS toLower(term))
-                    RETURN start.name as entity
-                """,
-                terms=search_terms
-                )
+            driver = GraphDatabase.driver("bolt://localhost:7687",
+                                    auth=("neo4j", os.getenv("NEO4J_PASSWORD")))
 
-                entities = [record["entity"] for record in scoring_result]
-                logger.info(f"Found entities: {entities}")
+            with driver.session(database=database_name) as session:
+                query_embedding = self.embed_model.encode(query, convert_to_tensor=True)
 
-                if not entities:
-                    logger.info("No matching entities found!")
-                    return []
-
-                # Now get scores for found entities
-                scoring_result = session.run("""
-                    MATCH (start:Entity)
-                    WHERE start.name IN $entities
-
-                    OPTIONAL MATCH (start)-[r]-(connected:Entity)
-                    WHERE type(r) <> 'CONTAINS' AND type(r) <> 'MENTIONED_IN'
-
-                    WITH start.name as entity,
-                        count(DISTINCT connected) as conn_count
-                    WITH collect({entity: entity, count: conn_count}) as results,
-                        max(conn_count) as max_count
-                    WHERE max_count > 0
-
-                    UNWIND results as result
-                    RETURN
-                        result.entity as entity,
-                        toFloat(result.count) / toFloat(max_count) * $max_score as score
-                    ORDER BY score DESC
+                text_matches = session.run("""
+                    MATCH (e:Entity)-[:MENTIONED_IN]->(t:TextNode)
+                    RETURN DISTINCT
+                        t.text as text,
+                        collect(e.name) as entities
                     LIMIT $k
-                """,
-                entities=entities,
-                max_score=max_score,
-                k=k
-                )
+                """, k=k)
 
-                scored_entities = [(record["entity"], record["score"]) for record in scoring_result]
-                logger.info(f"Scored entities: {scored_entities}")
+                scored_entities = []
+                for record in text_matches:
+                    text_embedding = self.embed_model.encode(record["text"], convert_to_tensor=True)
+                    score = float(util.cos_sim(query_embedding, text_embedding)[0][0])
+                    scored_entities.append((record["text"], record["entities"], score))
 
-                # Get content for scored entities
-                nodes_with_scores = []
-                for entity, score in scored_entities:
-                    logger.info(f"\nFetching content for {entity}")
-                    content_result = session.run("""
-                        MATCH (e:Entity {name: $entity})<-[:CONTAINS]-(text:TextNode)
-                        RETURN
-                            text.text as text,
-                            text.metadata as metadata,
-                            text.source as source
-                        LIMIT 1
-                    """,
-                    entity=entity
-                    )
+                top_entities = sorted(scored_entities, key=lambda x: x[2], reverse=True)[:k]
+                return self._get_nodes_with_scores(session, top_entities)
 
-                    data = content_result.single()
-                    if data is None:
-                        logger.info(f"No TextNode found for {entity}")
-                        continue
+        except Exception as e:
+            logger.error(f"Error retrieving nodes: {str(e)}", exc_info=True)
+            return []
 
-                    # Get connections in separate query
-                    connections_result = session.run("""
-                        MATCH (e:Entity {name: $entity})-[r]-(connected:Entity)
-                        WHERE type(r) <> 'CONTAINS' AND type(r) <> 'MENTIONED_IN'
-                        RETURN collect(DISTINCT {
-                            entity: connected.name,
-                            relationship: type(r)
-                        }) as connections
-                    """,
-                    entity=entity
-                    )
-
-                    connections = connections_result.single()["connections"]
-
-                    # Create metadata dictionary
-                    metadata = {}
-                    if data.get("metadata") and isinstance(data["metadata"], dict):
-                        metadata.update(data["metadata"])
-
-                    metadata.update({
-                        "source": data.get("source"),
-                        "entity": entity,
-                        "graph_connections": [
-                            f"{conn['entity']} ({conn['relationship']})"
-                            for conn in connections
-                            if conn.get("entity")
-                        ]
-                    })
-
-                    # Create NodeWithScore
-                    node = TextNode(
-                        text=data.get("text", ""),
-                        metadata=metadata,
-                        id_=f"graph_entity_{entity}"
-                    )
-                    nodes_with_scores.append(NodeWithScore(node=node, score=score))
-
-                return nodes_with_scores
         finally:
-            driver.close()
+            if driver:
+                driver.close()
